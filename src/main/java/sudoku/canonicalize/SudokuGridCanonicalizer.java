@@ -1,14 +1,18 @@
 package sudoku.canonicalize;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
 import java.util.AbstractMap.SimpleImmutableEntry;
-import java.util.Set;
 import java.util.function.UnaryOperator;
 
 /**
@@ -39,7 +43,7 @@ public final class SudokuGridCanonicalizer {
     };
 
     /** Minimal set of moves for rearranging a Sudoku grid (reassigning digits excluded). */
-    private static final List<UnaryOperator<BitSet>> MOVES = Arrays.asList(
+    private static final List<Transformation> MOVES = Arrays.asList(
             // swap neighboring rows in the first floor
             new RowRearranger(1, 0, 2),
             // swap the two outer rows in the first floor
@@ -52,13 +56,14 @@ public final class SudokuGridCanonicalizer {
             new GridTransposer());
 
     /** Search space of all equivalent grids discovered until now. */
-    private final Set<BitSet> searchSpace;
+    private final Map<BitSet, Entry<BitSet, Transformation>> searchSpace;
 
     /** Work queue storing all grids and transformations which have yet to be explored. */
-    private final ArrayDeque<Entry<BitSet, UnaryOperator<BitSet>>> queue;
+    private final ArrayDeque<Entry<BitSet, Transformation>> queue;
 
     /** Lexicographically smallest grid which has been discovered until now. */
     private BitSet leastGrid;
+    private BitSet leastSource;
 
     /** Number of puzzles in the search space after which to print an update, {@code -1} to deactivate. */
     private int printProgress = -1;
@@ -86,8 +91,11 @@ public final class SudokuGridCanonicalizer {
      * @param initial grid that is being canonicalized
      */
     private SudokuGridCanonicalizer(final BitSet initial) {
-        searchSpace = new HashSet<>();
+        searchSpace = new HashMap<>();
         queue = new ArrayDeque<>();
+        searchSpace.put(initial, null);
+        leastSource = initial;
+        leastGrid = renumberGrid(initial);
         MOVES.forEach(move -> queue.addLast(new SimpleImmutableEntry<>(initial, move)));
     }
 
@@ -100,11 +108,13 @@ public final class SudokuGridCanonicalizer {
             final var currentGrid = current.getKey();
             final var currentMove = current.getValue();
             final var neighbor = currentMove.apply(currentGrid);
-            if (searchSpace.add(neighbor)) {
+            if (!searchSpace.containsKey(neighbor)) {
+                searchSpace.put(neighbor, current);
                 // we found a new equivalent grid, update our canonical candidate
                 final var renumbered = renumberGrid(neighbor);
                 if (leastGrid == null || GRID_COMPARATOR.compare(renumbered, leastGrid) < 0) {
                     leastGrid = renumbered;
+                    leastSource = neighbor;
                 }
 
                 // schedule further transformations
@@ -117,7 +127,7 @@ public final class SudokuGridCanonicalizer {
 
                 // report progress
                 if (printProgress >= 0 && searchSpace.size() % printProgress == 0) {
-                    System.err.println("Current search space size: " + searchSpace.size());
+                    System.err.println(System.currentTimeMillis() + "\t" + searchSpace.size() + "\t" + queue.size());
                 }
             }
         }
@@ -218,22 +228,45 @@ public final class SudokuGridCanonicalizer {
             System.exit(1);
         }
 
+        final ForkJoinPool pool = ForkJoinPool.commonPool();
         for (final var puzzle : args) {
-            if (puzzle.length() != GRID_SIZE) {
-                throw new IllegalArgumentException("Unexpected puzzle length for '" + puzzle + "': " + puzzle.length());
-            }
-            final BitSet initial = fromPuzzleString(puzzle);
-            final var canonicalizer = new SudokuGridCanonicalizer(initial);
-            canonicalizer.printProgress = 100_000;
-            canonicalizer.exploreSearchSpace();
-            System.out.println(toPuzzleString(canonicalizer.leastGrid));
+            pool.execute(() -> {
+                if (puzzle.length() != GRID_SIZE) {
+                    throw new IllegalArgumentException("Unexpected puzzle length for '" + puzzle + "': " + puzzle.length());
+                }
+                final BitSet initial = fromPuzzleString(puzzle);
+                final var canonicalizer = new SudokuGridCanonicalizer(initial);
+//                canonicalizer.printProgress = 100_000;
+                canonicalizer.exploreSearchSpace();
+                final List<Transformation> path = new ArrayList<>();
+                var move = canonicalizer.searchSpace.get(canonicalizer.leastSource);
+                while (move != null) {
+                    path.add(move.getValue());
+                    move = canonicalizer.searchSpace.get(move.getKey());
+                }
+                final var pathBuilder = new StringBuilder(toPuzzleString(canonicalizer.leastGrid)).append("\t<");
+                final int empty = pathBuilder.length();
+                Collections.reverse(path);
+                for (final var step : path) {
+                    step.toString(pathBuilder.append(pathBuilder.length() > empty ? ", " : ""));
+                }
+                if (!canonicalizer.leastGrid.equals(canonicalizer.leastSource)) {
+                    pathBuilder.append(pathBuilder.length() > empty ? ", " : "").append("Renumber");
+                }
+                System.out.println(pathBuilder.append('>'));
+            });
         }
+        pool.awaitQuiescence(365L, TimeUnit.DAYS);
+    }
+
+    private interface Transformation extends UnaryOperator<BitSet> {
+        void toString(StringBuilder sb);
     }
 
     /**
      * Grid transformation which creates a copy of the input grid in which some or all lines are rearranged.
      */
-    private static final class RowRearranger implements UnaryOperator<BitSet> {
+    private static final class RowRearranger implements Transformation {
         /** Permutation of row indexes, may be shorter than nine lines. */
         private final int[] rowPermutation;
 
@@ -262,13 +295,22 @@ public final class SudokuGridCanonicalizer {
             }
             return out;
         }
+
+        @Override
+        public void toString(StringBuilder sb) {
+            if (rowPermutation.length == 3) {
+                sb.append("RowSwap[").append(rowPermutation[0] == 1 ? "0,1]" : "0,2]");
+            } else {
+                sb.append("FloorSwap[").append(rowPermutation[0] == 3 ? "0,1]" : "0,2]");
+            }
+        }
     }
 
     /**
      * Grid transformation which transposes the input grid, so the rows in the input grid are columns in the output grid
      * and vice versa.
      */
-    private static final class GridTransposer implements UnaryOperator<BitSet> {
+    private static final class GridTransposer implements Transformation {
         @Override
         public BitSet apply(final BitSet in) {
             final var out = new BitSet();
@@ -278,6 +320,11 @@ public final class SudokuGridCanonicalizer {
                 setDigit(out, HOUSE_SIZE * c + r, getDigit(in, i));
             }
             return out;
+        }
+
+        @Override
+        public void toString(StringBuilder sb) {
+            sb.append("Transpose");
         }
     }
 }

@@ -163,7 +163,6 @@ public class SudokuGridParser {
                                         currentCell.setElimination(val - 1);
                                     }
                                 }
-                                eliminate = false;
                             }
                         }
                     }
