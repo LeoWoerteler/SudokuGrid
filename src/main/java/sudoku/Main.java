@@ -34,7 +34,7 @@ public class Main {
             public void keyReleased(KeyEvent e) {
                 super.keyReleased(e);
                 final var keyChar = e.getKeyChar();
-                final boolean svg = keyChar == 's', png = keyChar == 'p';
+                final boolean svg = Character.toLowerCase(keyChar) == 's', png = Character.toLowerCase(keyChar) == 'p';
                 if (svg || png) {
                     // press the 'S' key to create an SVG picture or the 'P' key to create a PNG picture
                     // in the `pictures/` subdirectory
